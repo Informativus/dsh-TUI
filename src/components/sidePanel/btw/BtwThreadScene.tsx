@@ -15,6 +15,7 @@ import { setClipboard } from '../../../ink/termio/osc.js'
 import { btwThreads } from './threads.js'
 import { getBtwContextBudget, getBtwContextTurns } from '../../../tuiDisplayPrefs.js'
 import { BtwComposer, btwComposerKey } from './BtwComposer.js'
+import { expandBtwImages } from './btwImages.js'
 import { useBtwComposerPaste } from './useBtwComposerPaste.js'
 import { BtwThreadView } from './BtwThreadView.js'
 import type { BtwTurn } from './threads.js'
@@ -117,7 +118,7 @@ export function BtwThreadScene({
         if (result.exitFocus === true) { setComposerFocus(false); return }
         if (result.submit === true) {
           if (text.trim() !== '') {
-            const outcome = btwThreads.submit(sessionId, text, (question, options) => channel.sideQuestion(question, options), { recentTurnsLimit: getBtwContextTurns(), contextBudget: getBtwContextBudget() })
+            const outcome = btwThreads.submit(sessionId, text, (question, options) => channel.sideQuestion(expandBtwImages(question), options), { recentTurnsLimit: getBtwContextTurns(), contextBudget: getBtwContextBudget() })
             if (!outcome.ok) setNotice({ text: t('btw-thread-busy'), failure: true })
             else {
               btwThreads.setDraft(sessionId, '')
@@ -202,6 +203,7 @@ export function BtwThreadScene({
         busy={busy}
         notice={notice === null ? undefined : notice}
         onActivate={activateComposer}
+        width={columns - 2}
       />
     </Box>
   )

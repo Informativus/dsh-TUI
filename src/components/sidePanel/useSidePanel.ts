@@ -103,6 +103,21 @@ function useLive<T>(subscribe: (listener: () => void) => () => void, get: () => 
   return React.useSyncExternalStore(subscribe, get)
 }
 
+/**
+ * Readline-style editing combos a text-editing panel may claim before the
+ * chat sees them (see handleKey). Global Ctrl actions (C, D, L, …) and Esc
+ * are deliberately not in the set.
+ */
+function isTextEditCombo(input: string, key: SidePanelKeyFlags): boolean {
+  const flags = key as SidePanelKeyFlags & { readonly backspace?: boolean; readonly delete?: boolean }
+  const erase = flags.backspace === true || flags.delete === true
+  if (key.escape === true) return false
+  if (key.ctrl === true) return ['u', 'k', 'w', 'a', 'e'].includes(input)
+  if (key.super === true) return erase || input === 'u'
+  if (key.meta === true) return erase || key.leftArrow === true || key.rightArrow === true || input === 'b' || input === 'f'
+  return false
+}
+
 export function useSidePanel(options: UseSidePanelOptions): SidePanelController {
   const { columns, fullscreen, editorOpen } = options
   const splitEnabled = useLive(subscribeSidePanelSplitEnabled, getSidePanelSplitEnabled)
@@ -131,10 +146,10 @@ export function useSidePanel(options: UseSidePanelOptions): SidePanelController 
 
   // Panel 键盘分发器（v2.1：活动 Panel 的业务键先吃，宿主回退键兜底）。
   // 稳定引用：注册表本身放 ref，runtime 对象在整个会话期不变。
-  const inputHandlersRef = React.useRef(new Map<string, { handler: Parameters<SidePanelRuntime['registerInput']>[1]; enabled: boolean }>())
+  const inputHandlersRef = React.useRef(new Map<string, { handler: Parameters<SidePanelRuntime['registerInput']>[1]; enabled: boolean; editsText: boolean }>())
   const runtime = React.useMemo<SidePanelRuntime>(() => ({
-    registerInput: (panelId, handler, enabled) => {
-      inputHandlersRef.current.set(panelId, { handler, enabled })
+    registerInput: (panelId, handler, enabled, editsText = false) => {
+      inputHandlersRef.current.set(panelId, { handler, enabled, editsText })
       return () => {
         if (inputHandlersRef.current.get(panelId)?.handler === handler) {
           inputHandlersRef.current.delete(panelId)
@@ -302,12 +317,41 @@ export function useSidePanel(options: UseSidePanelOptions): SidePanelController 
     // exception: this ink reports a lone ESC as { escape, meta }, so the
     // meta pass-through must NOT claim it — Esc belongs to the panel
     // first (Detail → Dashboard) and then to the host fallback (→ chat).
+    // Exception: a panel that is editing text (the btw composer) takes the
+    // readline editing combos first — Ctrl+U/K/W/A/E, Alt/Option+Backspace,
+    // Alt+←/→ (ESC b / ESC f) and Cmd+Backspace. Without this they leaked to
+    // the still-active chat input and edited the hidden main draft instead.
+    // Keys the panel declines still fall through to Chat below.
+    if (split && activePanelId !== undefined && isTextEditCombo(input, key)
+      && inputHandlersRef.current.get(activePanelId)?.editsText === true
+      && runtime.dispatchKey(activePanelId, input, key)) {
+      stop()
+      return true
+    }
     if (key.ctrl === true || (key.meta === true && key.escape !== true)) return false
     // v2.1 第一棒：活动 Panel 的业务键优先（Subagent Detail 的 ←/→ 翻页、
     // Esc 返回 Dashboard 都先由它自己决定）；它没吃才轮到宿主回退键。
     if (activePanelId !== undefined && runtime.dispatchKey(activePanelId, input, key)) {
       stop()
       return true
+    }
+    // Vim-style keys while the panel has focus: the active panel saw the raw
+    // key first and did not consume it, so its own text inputs keep every
+    // letter. j/k = ↓/↑, h/l = previous/next panel.
+    // Ctrl/Alt combos already returned above; Esc keeps its branch below.
+    if (key.escape !== true && input.length === 1) {
+      if (input === 'j' || input === 'k') {
+        if (activePanelId !== undefined) {
+          runtime.dispatchKey(activePanelId, '', (input === 'j' ? { downArrow: true } : { upArrow: true }) as SidePanelKeyFlags)
+        }
+        stop()
+        return true
+      }
+      if (input === 'h' || input === 'l') {
+        cyclePanel(input === 'h' ? -1 : 1)
+        stop()
+        return true
+      }
     }
     if (key.escape === true) {
       setFocus('chat')
