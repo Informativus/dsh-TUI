@@ -115,8 +115,12 @@ export type PanelKeyHandler = (input: string, key: SidePanelKeyFlags) => boolean
  * 由 useSidePanel 创建（Chat 侧），经 context 抵达右栏子树。
  */
 export interface SidePanelRuntime {
-  /** 注册 Panel 的键盘处理器；enabled=false 时保留注册但不投递。 */
-  registerInput: (panelId: string, handler: PanelKeyHandler, enabled: boolean) => () => void
+  /**
+   * 注册 Panel 的键盘处理器；enabled=false 时保留注册但不投递。
+   * editsText=true：Panel 正在编辑文本，Ctrl+U/K/W/A/E、Alt/Option+Backspace、
+   * Alt+←/→、Cmd+Backspace 这类编辑组合先交给它，不再漏给主输入框。
+   */
+  registerInput: (panelId: string, handler: PanelKeyHandler, enabled: boolean, editsText?: boolean) => () => void
   /** 键盘分发的第一棒：焦点在右栏时先问活动 Panel 吃不吃这个键。 */
   dispatchKey: (panelId: string, input: string, key: SidePanelKeyFlags) => boolean
 }

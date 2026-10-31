@@ -19,6 +19,7 @@ import { t } from '../../../i18n.js'
 import { flattenPasteInline } from '../../../channel/sanitize.js'
 import { readClipboard, type ClipboardRead } from '../../../utils/clipboard.js'
 import { btwThreads } from './threads.js'
+import { btwImageTokenForPaste, btwImageTokensForFiles } from './btwImages.js'
 
 /** 粘贴失败的本地提示（显示到下一次动作，与提交失败同一条通道）。 */
 export interface BtwPasteNotice {
@@ -83,14 +84,19 @@ export function useBtwComposerPaste(opts: {
           })
           return
         }
-        if (content.kind !== 'text') {
-          // 图片/文件没有 btw 的文本形态：明确提示，不落到任何输入框。
+        // 图片 / 图片文件：与主输入框一样落成 `[Image #N]`（见 btwImages）。
+        const imageTokens = content.kind === 'image'
+          ? btwImageTokensForFiles([content.path])
+          : content.kind === 'files' ? btwImageTokensForFiles(content.paths) : null
+        if (content.kind !== 'text' && imageTokens === null) {
+          // 非图片文件没有 btw 的文本形态：明确提示，不落到任何输入框。
           setNotice({ text: t('question-paste-not-text'), failure: false })
           return
         }
         // 单行框：换行/控制符压成空格，ANSI 序列整段剥掉（用户可控字节）。
         // 只剩空白的粘贴没有可插入的内容（与问卷面板同判据）。
-        const text = flattenPasteInline(content.text)
+        const text = imageTokens
+          ?? (content.kind === 'text' ? btwImageTokenForPaste(content.text) ?? flattenPasteInline(content.text) : '')
         if (text.trim() === '') {
           setNotice({ text: t('input-clipboard-empty'), failure: false })
           return

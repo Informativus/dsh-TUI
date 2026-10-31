@@ -9,11 +9,16 @@
 import React from 'react'
 import { Box, Text, InputCaret, useTerminalSize } from '../../../ui.js'
 import { stringWidth } from '../../../ink/stringWidth.js'
+import measureElement from '../../../ink/measure-element.js'
+import type { DOMElement } from '../../../ink/dom.js'
 import { t } from '../../../i18n.js'
 import { actionMatches } from '../../../utils/keymap.js'
 import { flattenPasteInline } from '../../../channel/sanitize.js'
 import type { SidePanelKeyFlags } from '../types.js'
 import { nextCodePoint, previousCodePoint } from '../../AgentMessageComposer.js'
+import { isMod } from '../../../utils/modifiers.js'
+import { wordBoundaryLeft, wordBoundaryRight } from '../../../utils/inputWordBoundary.js'
+import { btwImageTokenEndingAt, btwImageTokenForPaste, btwImageTokenStartingAt } from './btwImages.js'
 
 /** 编辑态（text 来自线程 store；caret 属于当前 surface）。 */
 export interface BtwComposerState {
@@ -42,6 +47,8 @@ type BtwKeyFlags = SidePanelKeyFlags & {
   readonly home?: boolean
   readonly end?: boolean
   readonly return?: boolean
+  /** Cmd（kitty CSI-u / modifyOtherKeys 才带）。 */
+  readonly super?: boolean
   /** 终端原生粘贴（bracketed paste）整块到达时置位。 */
   readonly isPasted?: boolean
 }
@@ -62,7 +69,9 @@ export function btwComposerKey(state: BtwComposerState, input: string, key: BtwK
   // 打上 isPasted：单行框先压成一行再插，纯换行的块是文本、绝不是 Enter。
   // 必须排在 plainReturn 之前——粘贴块也可能带着 return 标记。
   if (key.isPasted === true) {
-    const text = flattenPasteInline(input)
+    // 粘贴的是一个现存图片文件的路径（拖入 / Orca 截图粘贴）：与主输入框
+    // 一样显示成 `[Image #N]`，不把整段临时路径摊进输入框。
+    const text = btwImageTokenForPaste(input) ?? flattenPasteInline(input)
     // 纯换行/空白压完是空格，trim 后为空 = 没有可插入的文本（不是 Enter）。
     if (text.trim() === '') return {}
     return { state: { text: state.text.slice(0, caret) + text + state.text.slice(caret), caret: caret + text.length } }
@@ -78,11 +87,32 @@ export function btwComposerKey(state: BtwComposerState, input: string, key: BtwK
   // ↑ 也从编辑层上到列表：光标落在本轮标题上（列表形态默认选中最后一条）。
   if (key.upArrow === true) return { exitFocus: true }
   if (key.downArrow === true) return {}
-  if (key.backspace === true || key.delete === true) {
-    if (caret <= 0) return { state: { ...state, caret } }
-    const at = previousCodePoint(state.text, caret)
-    return { state: { text: state.text.slice(0, at) + state.text.slice(caret), caret: at } }
+  const cut = (from: number, to: number): BtwComposerKeyResult =>
+    ({ state: { text: state.text.slice(0, from) + state.text.slice(to), caret: from } })
+  const erase = key.backspace === true || key.delete === true
+  // Cmd+Backspace（终端多半发 Ctrl+U，kitty 协议发 super+Backspace）/ Ctrl+U：
+  // 删到行首（单行框 = 草稿开头）。Ctrl+K：删到行尾。
+  if ((erase && key.super === true) || (isMod(key) && input === 'u')) return cut(0, caret)
+  if (isMod(key) && input === 'k') return cut(caret, state.text.length)
+  // Option/Alt+Backspace 与 Ctrl+W：删前一个词（readline 规则，与主输入框一致）；
+  // 光标前紧贴着 `[Image #N]` 时整块删除。
+  if ((erase && key.meta === true) || (key.ctrl === true && input === 'w')) {
+    return cut(btwImageTokenEndingAt(state.text, caret) ?? wordBoundaryLeft(state.text, caret), caret)
   }
+  if (erase) {
+    if (caret <= 0) return { state: { ...state, caret } }
+    // `[Image #N]` 是原子 token：退格删整块。
+    return cut(btwImageTokenEndingAt(state.text, caret) ?? previousCodePoint(state.text, caret), caret)
+  }
+  // Option/Alt+←/→（终端常发 ESC b / ESC f）：按词跳。
+  if (key.meta === true && (key.leftArrow === true || input === 'b')) {
+    return { state: { ...state, caret: btwImageTokenEndingAt(state.text, caret) ?? wordBoundaryLeft(state.text, caret) } }
+  }
+  if (key.meta === true && (key.rightArrow === true || input === 'f')) {
+    return { state: { ...state, caret: btwImageTokenStartingAt(state.text, caret) ?? wordBoundaryRight(state.text, caret) } }
+  }
+  if (isMod(key) && input === 'a') return { state: { ...state, caret: 0 } }
+  if (isMod(key) && input === 'e') return { state: { ...state, caret: state.text.length } }
   // Shift+←/→ 不归编辑层：返回未消费，面板形态下落宿主切面板（宿主的
   // leftArrow 判定不看 shift）——编辑中途也能一键换面板，不必先 Esc 收起。
   if ((key.leftArrow === true || key.rightArrow === true) && key.shift === true) return null
@@ -90,11 +120,11 @@ export function btwComposerKey(state: BtwComposerState, input: string, key: BtwK
   // 面板形态下落宿主切面板，底栏「←/→ 切换」因此在编辑层同样成立；场景
   // 形态下无人接管，等于空操作。
   if (key.leftArrow === true) {
-    const previous = previousCodePoint(state.text, caret)
+    const previous = btwImageTokenEndingAt(state.text, caret) ?? previousCodePoint(state.text, caret)
     return previous === caret ? null : { state: { ...state, caret: previous } }
   }
   if (key.rightArrow === true) {
-    const next = nextCodePoint(state.text, caret)
+    const next = btwImageTokenStartingAt(state.text, caret) ?? nextCodePoint(state.text, caret)
     return next === caret ? null : { state: { ...state, caret: next } }
   }
   if (key.home === true) return { state: { ...state, caret: 0 } }
@@ -125,7 +155,9 @@ export function wrapComposerDraft(
   let caretRow = 0
   for (let i = 0; i < text.length || i === caret;) {
     const atEnd = i >= text.length
-    const next = atEnd ? i + 1 : nextCodePoint(text, i)
+    // `[Image #N]` is one unbreakable unit (the caret never sits inside it).
+    const token = atEnd ? null : btwImageTokenStartingAt(text, i)
+    const next = atEnd ? i + 1 : token !== null && !(caret > i && caret < token) ? token : nextCodePoint(text, i)
     const cells = atEnd ? 1 : stringWidth(text.slice(i, next))
     if (used + cells > width && i > start) {
       rows.push({ start, end: i })
@@ -164,8 +196,21 @@ export function BtwComposer({
   const shown = Math.min(caret, text.length)
   const afterCaret = nextCodePoint(text, shown)
   const { columns } = useTerminalSize()
+  // The real box width wins over the width prop / terminal context: when the
+  // two disagree (a panel column narrower than its declared width), rows
+  // wrapped to the larger number overflow, ink re-wraps the caret row itself,
+  // the `›` is squeezed out and the native caret stays on the first visual
+  // row. Measure after layout and re-wrap once to the measured width.
+  const boxRef = React.useRef<DOMElement | null>(null)
+  const [measuredWidth, setMeasuredWidth] = React.useState<number | null>(null)
+  React.useLayoutEffect(() => {
+    const node = boxRef.current
+    if (node === null) return
+    const measured = Math.floor(measureElement(node).width)
+    if (measured > 0 && measured !== measuredWidth) setMeasuredWidth(measured)
+  })
   // 边框 2 + 左右 padding 2 + 「› 」2 = 6 列不属于草稿。
-  const { rows, caretRow } = wrapComposerDraft(text, shown, Math.max(1, (width ?? columns) - 6))
+  const { rows, caretRow } = wrapComposerDraft(text, shown, Math.max(1, (measuredWidth ?? width ?? columns) - 6))
   const firstRow = Math.max(0, caretRow - MAX_DRAFT_ROWS + 1)
   return (
     <Box flexDirection="column" flexShrink={0}>
@@ -174,6 +219,7 @@ export function BtwComposer({
           交给面板（stopImmediatePropagation 掐掉的正是祖先的 onClick——焦点还在
           聊天时点这里等于没点，得先点一次非输入区），然后再切本面板的编辑层。 */}
       <Box
+        ref={boxRef}
         width="100%"
         flexShrink={0}
         borderStyle="round"

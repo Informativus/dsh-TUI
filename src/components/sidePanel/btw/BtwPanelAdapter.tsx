@@ -20,6 +20,7 @@ import { setClipboard } from '../../../ink/termio/osc.js'
 import { btwThreads } from './threads.js'
 import { getBtwContextBudget, getBtwContextTurns } from '../../../tuiDisplayPrefs.js'
 import { BtwComposer, btwComposerKey, type BtwComposerState } from './BtwComposer.js'
+import { expandBtwImages } from './btwImages.js'
 import { useBtwComposerPaste } from './useBtwComposerPaste.js'
 import { BtwThreadView } from './BtwThreadView.js'
 import type { PanelKeyHandler, PanelProps } from '../types.js'
@@ -128,7 +129,7 @@ export function BtwPanelAdapter({ width, height, focused, visible }: PanelProps)
   const submitDraft = React.useCallback(() => {
     const text = btwThreads.get(sessionId)?.draft ?? ''
     if (text.trim() === '') return
-    const result = btwThreads.submit(sessionId, text, (question, options) => channel.sideQuestion(question, options), btwContextOptions())
+    const result = btwThreads.submit(sessionId, text, (question, options) => channel.sideQuestion(expandBtwImages(question), options), btwContextOptions())
     if (!result.ok) {
       setNotice({
         text: t(result.reason === 'busy' || result.reason === 'congested' ? 'btw-thread-busy' : 'btw-thread-followup'),
@@ -233,7 +234,7 @@ export function BtwPanelAdapter({ width, height, focused, visible }: PanelProps)
     return false
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, submitDraft, newTopic, sendToChat, copySelected, moveSelection, selectedTurnNow, height, setCaret, paste])
-  usePanelInput(onKey, { active: focused && visible })
+  usePanelInput(onKey, { active: focused && visible, editsText: composerFocus })
 
   // ── 头部（只有线程后才画）：首问标题 + 状态徽 + 新话题，下压一条细线 ──
   // 空线程不画头部：标题没有内容，`新话题` 在空线程上也无事可做（清空/换题的
