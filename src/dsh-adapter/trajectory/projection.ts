@@ -23,10 +23,11 @@
  * exploits exactly that: when the incoming snapshot prefix-extends the one the
  * previous build consumed — proven by *object identity* at the previous last
  * index, never by `seq` arithmetic, which a fork can rewind — only the new
- * tail is folded. Any other relationship (agent swap on `/resume`, `/rewind`,
- * `/new`) rebuilds from scratch. A long session therefore never pays an O(n)
- * refold per frame, and `verify-trace-projection` asserts that the incremental
- * and from-scratch results are field-for-field identical at every split point.
+ * tail is folded. The neutral agent source additionally proves its lane
+ * identity and tail-only replacement contract: a timing-only last chunk can
+ * be consumed again, followed by the new suffix. Merged lane snapshots can
+ * replace interior events and must rebuild. Other replacements (agent swap
+ * on `/resume`, `/rewind`, `/new`) also rebuild from scratch.
  *
  * ## What it deliberately does not do
  *
@@ -71,6 +72,7 @@ import {
   type RawTrajEvent,
 } from './guards.js'
 import { BURST_MIN, type TrajKind, type TrajNode, type TrajTokens } from './types.js'
+import { agentTrajectoryContinuation } from './agent-source.js'
 
 
 /** Per-step streaming timestamps, the source of TTFT and decode duration. */
@@ -181,8 +183,10 @@ function newState(): FoldState {
 /**
  * Clone the fold state for a continuation.
  *
- * The bracket maps are copied so a continuation does not mutate its input's
- * bookkeeping — but `runMembers` is deliberately SHARED, not copied: once a
+ * Collections are SHARED, like nodes, timing and counts: this is mutable
+ * continuation bookkeeping, not a public immutable source snapshot. Copying
+ * tokenTurns (and potentially large sets of open brackets) costs O(history)
+ * on each append for no isolation benefit. `runMembers` must also stay shared: once a
  * run reaches {@link BURST_MIN} the synthetic burst node holds that very
  * array, and a run that spans an incremental boundary must keep growing the
  * array the node already references. Copying it here would silently freeze
@@ -198,16 +202,16 @@ function cloneState(previous: FoldState): FoldState {
     // being extended, and a continuation must keep incrementing the same
     // object the caller already holds.
     counts: previous.counts,
-    tools: new Map(previous.tools),
-    subtools: new Map(previous.subtools),
-    steps: new Map(previous.steps),
-    turns: new Map(previous.turns),
-    retries: new Map(previous.retries),
-    approvals: new Map(previous.approvals),
-    hooks: new Map(previous.hooks),
-    compactions: [...previous.compactions],
+    tools: previous.tools,
+    subtools: previous.subtools,
+    steps: previous.steps,
+    turns: previous.turns,
+    retries: previous.retries,
+    approvals: previous.approvals,
+    hooks: previous.hooks,
+    compactions: previous.compactions,
     turn: previous.turn,
-    tokenTurns: new Set(previous.tokenTurns),
+    tokenTurns: previous.tokenTurns,
     step: previous.step,
     seeding: previous.seeding,
     runKey: previous.runKey,
@@ -830,6 +834,37 @@ export function emptyTrajectory(): TrajBuild {
 }
 
 /**
+ * Called ONLY after the source proved same-lane provenance. That contract
+ * guarantees the prefix before this slot is unchanged, even if snapshots were
+ * skipped. Shape/seq checks alone (or a matching neighbor) cannot prove it.
+ */
+function isTimingTailUpdate(previous: TrajBuild, raw: readonly RawTrajEvent[]): boolean {
+  const index = previous.source.length - 1
+  const before = previous.source[index]
+  const after = raw[index]
+  if (before === after || before?.type !== 'assistant/chunk' || after?.type !== 'assistant/chunk'
+    || !Number.isFinite(before.seq) || after.seq !== before.seq
+    || !Number.isFinite(before.time) || !Number.isFinite(after.time) || after.time < before.time
+    || (index > 0 && raw[index - 1] !== previous.source[index - 1])) return false
+  const oldData = before.data as Record<string, unknown> | undefined
+  const data = after.data as Record<string, unknown> | undefined
+  if (typeof data?.turn !== 'number' || !Number.isFinite(data.turn)
+    || typeof data?.step !== 'number' || !Number.isFinite(data.step)
+    || data.turn !== oldData?.turn || data.step !== oldData?.step) return false
+  const slot = previous.timing.get(`${data.turn}:${data.step}`)
+  if (slot === undefined) return true // Both chunks are silent without a step.
+  if (slot.lastChunk !== before.time) return false
+  if (slot.firstChunk !== before.time) return true
+  // If this tail supplied firstChunk, re-consuming would keep its OLD time.
+  // An adjacent retained chunk at the same position proves that firstChunk
+  // instead belongs to the unchanged prefix (including equal-clock chunks).
+  const retained = previous.source[index - 1]
+  const retainedData = retained?.data as Record<string, unknown> | undefined
+  return retained?.type === 'assistant/chunk'
+    && retainedData?.turn === data.turn && retainedData?.step === data.step
+}
+
+/**
  * Extend a previous projection with the session's current event snapshot.
  *
  * @param previous - The prior build, or `null` to fold from scratch.
@@ -841,17 +876,21 @@ export function extendTrajectory(
   events: readonly RawTrajEvent[],
 ): TrajBuild {
   const raw = asRawEvents(events)
+  if (previous?.source === raw) return previous
+  const continuation = previous === null ? undefined : agentTrajectoryContinuation(previous.source, raw)
+  const replacingTail = previous !== null && continuation === 'lane'
+    && raw.length >= previous.source.length && isTimingTailUpdate(previous, raw)
   if (
-    previous !== null &&
+    previous !== null && continuation !== 'rebuild' &&
     raw.length >= previous.source.length &&
     (previous.source.length === 0 ||
-      raw[previous.source.length - 1] === previous.source[previous.source.length - 1])
+      raw[previous.source.length - 1] === previous.source[previous.source.length - 1] || replacingTail)
   ) {
-    if (raw.length === previous.source.length) return previous
+    if (raw.length === previous.source.length && !replacingTail) return previous
     const nodes = previous.nodes
     const timing = previous.timing
     const state = cloneState(previous.state)
-    for (let index = previous.source.length; index < raw.length; index++) {
+    for (let index = previous.source.length - (replacingTail ? 1 : 0); index < raw.length; index++) {
       consume(state, nodes, timing, raw[index]!)
     }
     syncRowCount(state, nodes)

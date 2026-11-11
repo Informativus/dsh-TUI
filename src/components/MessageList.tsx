@@ -535,6 +535,8 @@ export function MessageList({
   // under a fresh root, and each root owns its row ids.
   const revealScope = useRevealScope()
   const hiddenCount = rows.length - RENDERED_ROW_CAP
+  const windowStart = showAll || hiddenCount <= 0 ? 0 : hiddenCount
+  const windowLength = rows.length - windowStart
   // The thinking filter runs BEFORE virtualization so window indices line up.
   //
   // Fingerprint memo: every scroll tick re-rendered this pipeline even when
@@ -544,11 +546,13 @@ export function MessageList({
   // profile). The inputs are all identity-stable across ticks: channel.rows
   // is a live in-place array (identity changes only on rewind/new session),
   // showAll/thinkingVisible are React state. Rows APPENDED in place keep the
-  // identity — the cache must key on rows.length too (streaming appends).
+  // identity — the cache must key on the candidate window's start and size
+  // too. Fingerprints only inspect that window: hidden rows cannot affect
+  // its filtering or job groups, and showAll explicitly widens it again.
   const visibleRowsCacheRef = React.useRef<{
     rows: readonly ChatRow[]
-    rowsLength: number
-    showAll: boolean
+    windowStart: number
+    windowLength: number
     thinkingVisible: boolean
     out: readonly ChatRow[]
     margins: ReadonlyMap<number, boolean>
@@ -571,11 +575,11 @@ export function MessageList({
   // assistant row that settles with EMPTY text crosses the empty-assistant
   // filter boundary (visible-while-streaming → filtered-when-settled).
   // Allocation-free scan; rebuild only when a bit actually flipped.
-  let streamBitsSame = visibleCache !== null && visibleCache.streamBits.length === rows.length
+  let streamBitsSame = visibleCache !== null && visibleCache.windowStart === windowStart && visibleCache.windowLength === windowLength
   if (streamBitsSame) {
     const bits = visibleCache!.streamBits
-    for (let i = 0; i < rows.length; i++) {
-      if (bits[i] !== (rows[i]!.streaming === true ? 1 : 0)) { streamBitsSame = false; break }
+    for (let i = 0; i < windowLength; i++) {
+      if (bits[i] !== (rows[windowStart + i]!.streaming === true ? 1 : 0)) { streamBitsSame = false; break }
     }
   }
   // Job-group fingerprint: job statuses land IN PLACE (`row.job` is
@@ -583,9 +587,9 @@ export function MessageList({
   // toggles live in a Set — none of that shows up in the rows identity or
   // length key above, yet both decide whether a consecutive-job run folds,
   // and a folded run REMOVES its members from the visible window. One
-  // allocation-free pass over the row list (only job rows feed the hash).
+  // allocation-free pass over the candidate window (only job rows feed the hash).
   let jobsSig = (expanded ? 1 : 0) * 7 + (jobGroupFold === 'always' ? 1 : jobGroupFold === 'never' ? 2 : 3)
-  for (let i = 0; i < rows.length; i++) {
+  for (let i = windowStart; i < rows.length; i++) {
     const row = rows[i]!
     if (row.kind !== 'job' || row.job === undefined) continue
     jobsSig = (jobsSig * 33 + row.id + jobStatusCode(row.job.status) + (expandedRows.has(row.id) ? 7 : 0)) | 0
@@ -593,16 +597,14 @@ export function MessageList({
   if (
     visibleCache === null ||
     visibleCache.rows !== rows ||
-    visibleCache.rowsLength !== rows.length ||
-    visibleCache.showAll !== (showAll || hiddenCount <= 0) ||
+    visibleCache.windowStart !== windowStart ||
+    visibleCache.windowLength !== windowLength ||
     visibleCache.thinkingVisible !== thinkingVisible ||
     visibleCache.jobsSig !== jobsSig ||
     visibleCache.turnRowOn !== turnUsageRow ||
     !streamBitsSame
   ) {
-    const sliced = showAll || hiddenCount <= 0
-      ? rows
-      : rows.slice(hiddenCount)
+    const sliced = windowStart === 0 ? rows : rows.slice(windowStart)
     // Empty settled assistant rows (PR #383's duplicate-dot bug): when the
     // model calls a tool without producing text, the assistant/message event
     // carries empty text — rendered as a lone `●` bullet dangling above the
@@ -758,12 +760,12 @@ export function MessageList({
         prev = row.kind
       }
     }
-    const streamBits = new Uint8Array(rows.length)
-    for (let i = 0; i < rows.length; i++) streamBits[i] = rows[i]!.streaming === true ? 1 : 0
+    const streamBits = new Uint8Array(windowLength)
+    for (let i = 0; i < windowLength; i++) streamBits[i] = rows[windowStart + i]!.streaming === true ? 1 : 0
     visibleRowsCacheRef.current = {
       rows,
-      rowsLength: rows.length,
-      showAll: showAll || hiddenCount <= 0,
+      windowStart,
+      windowLength,
       thinkingVisible,
       out: visibleOut,
       margins,
