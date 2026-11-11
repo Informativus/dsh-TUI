@@ -53,13 +53,34 @@
  * deduplication (a reconnect may replay a durable chunk), never as envelope
  * identity — the envelope stays monotonic in emission order for the
  * inspector's binary search. Emitted events and payloads are frozen. The
- * current attempt's tail chunk may be replaced in a new snapshot; older
- * snapshots remain unchanged. Merged descendants rebuild when a lane changes.
+ * current attempt's latest chunk may be replaced ONLY while it is the lane
+ * tail; older snapshots remain unchanged. Snapshot provenance lets the fold
+ * prove that everything before the prior tail is unchanged. Merged descendants
+ * carry no such guarantee: a lane tail may be inside the merged snapshot.
  */
 
 import type { AgentEvent } from '../../agent/events.js'
 import type { RawTrajEvent } from './guards.js'
 import type { TrajectoryLane } from './types.js'
+
+/** Single-lane identity, or null for merged snapshots whose interior can change. */
+const snapshotLanes = new WeakMap<readonly RawTrajEvent[], object | null>()
+
+/**
+ * Only snapshots published by this source can prove the tail-replacement
+ * contract. A fresh lane/reset/re-key gets a fresh identity; merged snapshots
+ * must rebuild even when their last event retained its identity. Undefined
+ * leaves other (append-only session log) sources to their existing contract.
+ */
+export function agentTrajectoryContinuation(
+  previous: readonly RawTrajEvent[],
+  current: readonly RawTrajEvent[],
+): 'lane' | 'rebuild' | undefined {
+  const before = snapshotLanes.get(previous)
+  const after = snapshotLanes.get(current)
+  if (before === undefined && after === undefined) return undefined
+  return before !== undefined && before !== null && before === after ? 'lane' : 'rebuild'
+}
 
 /** The neutral source a backend-neutral composition mounts. */
 export interface AgentTrajectorySource {
@@ -104,6 +125,8 @@ interface LaneFold {
   /** Undefined for the main session lane; the subagent id for a child lane. */
   readonly agentId: string | undefined
   emitted: RawTrajEvent[]
+  /** Opaque provenance token; retaining a snapshot must not retain the live fold. */
+  readonly snapshotLane: object
   /**
    * The published snapshot, rebuilt lazily after a lane change.
    */
@@ -131,7 +154,8 @@ function newFold(agentId: string | undefined): LaneFold {
   return {
     agentId,
     emitted: [],
-    snapshot: Object.freeze([]),
+    snapshotLane: {},
+    snapshot: undefined,
     seen: new Set<string>(),
     turn: 0,
     attempt: undefined,
@@ -353,7 +377,8 @@ export function createAgentTrajectorySource(options?: { readonly clock?: () => n
           ? { turn: event.turn, step: event.step }
           : fold.attempt
         if (position === undefined) return
-        // Preserve the first chunk and keep the latest chunk in one replaceable slot.
+        // Preserve the first chunk; only the lane tail is replaceable. Once an
+        // event intervenes, append so published prefixes never change behind it.
         let current = fold.attempt?.attemptId === event.attemptId ? fold.attempt : undefined
         if (current === undefined) {
           current = { attemptId: event.attemptId, turn: position.turn, step: position.step, thinkEstimated: 0, firstChunkIndex: undefined, lastChunkIndex: undefined }
@@ -363,7 +388,7 @@ export function createAgentTrajectorySource(options?: { readonly clock?: () => n
           const index = fold.emitted.length
           emitInto(fold, 'assistant/chunk', event.time, { turn: position.turn, step: position.step })
           current.firstChunkIndex = index
-        } else if (current.lastChunkIndex === undefined) {
+        } else if (current.lastChunkIndex !== fold.emitted.length - 1) {
           current.lastChunkIndex = fold.emitted.length
           emitInto(fold, 'assistant/chunk', event.time, { turn: position.turn, step: position.step })
         } else {
@@ -576,7 +601,10 @@ export function createAgentTrajectorySource(options?: { readonly clock?: () => n
 
   /** A lane snapshot: lazily frozen copy of the current fold. */
   const foldSnapshot = (fold: LaneFold): readonly RawTrajEvent[] => {
-    fold.snapshot ??= Object.freeze([...fold.emitted])
+    if (fold.snapshot === undefined) {
+      fold.snapshot = Object.freeze([...fold.emitted])
+      snapshotLanes.set(fold.snapshot, fold.snapshotLane)
+    }
     return fold.snapshot
   }
 
@@ -642,6 +670,7 @@ export function createAgentTrajectorySource(options?: { readonly clock?: () => n
       for (const fold of members) merged.push(...fold.emitted)
       merged.sort((a, b) => a.seq - b.seq)
       const snapshot = Object.freeze(merged)
+      snapshotLanes.set(snapshot, null)
       mergedCache = { agentId: root.agentId, version: laneVersion, snapshot }
       return snapshot
     },
