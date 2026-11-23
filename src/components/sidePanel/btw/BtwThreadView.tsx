@@ -149,8 +149,9 @@ export function BtwThreadView({
     if (version === 0 || previous.version === 0) return
     const grew = answerLengths !== previous.answerLengths
     if (!grew) return
-    if (follow) scrollRef.current?.scrollToBottom()
-    else setPendingJump(true)
+    // Sticky scrolling already pins growing content during paint; don't schedule
+    // another React render from the effect for every streamed delta.
+    if (!follow) setPendingJump(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [version, answerLengths, follow])
 
